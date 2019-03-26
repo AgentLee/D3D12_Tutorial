@@ -293,10 +293,29 @@ ComPtr<ID3D12CommandQueue> CreateCommandQueue(ComPtr<ID3D12Device2> device, D3D1
 	return d3d12CommandQueue;
 }
 
+// Tearing occurs when the image is out of sync with the vertical refresh rate.
 bool CheckTearingSupport()
 {
-	// TODO	
-	return false;
+	BOOL allowTearing = FALSE;
+
+	ComPtr<IDXGIFactory4> factory4;
+	if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4))))
+	{
+		ComPtr<IDXGIFactory5> factory5;
+		if (SUCCEEDED(factory4.As(&factory5)))
+		{
+			if (FAILED(factory5->CheckFeatureSupport(
+				DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+				&allowTearing,
+				sizeof(allowTearing)
+			)))
+			{
+				allowTearing = false;
+			}
+		}
+	}
+
+	return allowTearing == TRUE;
 }
 
 ComPtr<IDXGISwapChain4> CreateSwapChain(HWND hWnd,
@@ -534,6 +553,98 @@ void Render()
 	}
 }
 
+// Triggered when launching full screen mode or resizing the current window
+void Resize(uint32_t width, uint32_t height)
+{
+	if (gClientWidth != width || gClientHeight != height)
+	{
+		gClientWidth = std::max(1u, width);
+		gClientHeight = std::max(1u, height);
+
+		// Flush GPU to make sure none of the resources 
+		// are being used during the resizing
+		Flush(gCommandQueue, gFence, gFenceValue, gFenceEvent);
+
+		for (int i = 0; i < gNumFrames; ++i)
+		{
+			// Release references to the backbuffers
+			// to prevent unwanted behavior from resizing
+			// the swap chain
+			gBackBuffers[i].Reset();
+			gFrameFenceValues[i] = gFrameFenceValues[gCurrBackBufferIdx];
+		}
+
+		// Query the current swap chain descriptor 
+		// to make sure nothing changes during resizing
+		DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
+		ThrowIfFailed(gSwapChain->GetDesc(&swapChainDesc));
+		ThrowIfFailed(gSwapChain->ResizeBuffers(gNumFrames, gClientWidth, gClientHeight,
+			swapChainDesc.BufferDesc.Format, swapChainDesc.Flags));
+
+		// Update to the most recent back buffer index
+		gCurrBackBufferIdx = gSwapChain->GetCurrentBackBufferIndex();
+
+		UpdateRTVs(gDevice, gSwapChain, gRTVDescriptorHeap);
+	}
+}
+
+void SetFullscreen(bool fullscreen)
+{
+	if (gFullScreenMode != fullscreen)
+	{
+		gFullScreenMode = fullscreen;
+
+		if (gFullScreenMode)
+		{
+			// Store window dimensions so that you can
+			// go back to this size when getting out
+			// of fullscreen mode
+			::GetWindowRect(gHWnd, &gWindowRect);
+
+			// Change to borderless
+			UINT windowStyle = WS_OVERLAPPEDWINDOW & 
+				~(WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+
+			::SetWindowLongW(gHWnd, GWL_STYLE, windowStyle);
+
+			// Query the name of the nearest display device for the window
+			// Required for fullscreen multi-monitor setups
+			HMONITOR hMonitor = ::MonitorFromWindow(gHWnd, MONITOR_DEFAULTTONEAREST);
+			MONITORINFOEX monitorInfo = {};
+			monitorInfo.cbSize = sizeof(MONITORINFOEX);
+			::GetMonitorInfo(hMonitor, &monitorInfo);
+
+			// Change position and make sure the window is visible
+			::SetWindowPos(
+				gHWnd,		// handle to window 
+				HWND_TOP,	// place order (top of the window stack)
+				monitorInfo.rcMonitor.left,
+				monitorInfo.rcMonitor.top,
+				monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
+				monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
+				SWP_FRAMECHANGED | SWP_NOACTIVATE);
+
+			::ShowWindow(gHWnd, SW_MAXIMIZE);
+		}
+		else
+		{
+			// Change back to original and restore
+			::SetWindowLong(gHWnd, GWL_STYLE, WS_OVERLAPPEDWINDOW);
+
+			::SetWindowPos(
+				gHWnd, 
+				HWND_NOTOPMOST,
+				gWindowRect.left,
+				gWindowRect.top,
+				gWindowRect.right - gWindowRect.left,
+				gWindowRect.bottom - gWindowRect.top,
+				SWP_FRAMECHANGED | SWP_NOACTIVATE);
+
+			::ShowWindow(gHWnd, SW_NORMAL);
+		}
+	}
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	if (gIsInitialized)
@@ -543,6 +654,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case WM_PAINT:
 			Update();
 			Render();
+			break;
+		case WM_SYSKEYDOWN:
+		case WM_KEYDOWN:
+		{
+			bool alt = (::GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+			switch (wParam)
+			{
+			case 'V':
+				gVsync = !gVsync;
+				break;
+			case VK_ESCAPE:
+				::PostQuitMessage(0);
+				break;
+			case VK_RETURN:
+				if (alt)
+				{
+			case VK_F11:
+				SetFullscreen(!gFullScreenMode);
+				}
+				break;
+			}
+		}
+			break;
+		case WM_SYSCHAR:
+			break;
+		case WM_SIZE:
+		{
+			RECT clientRect = {};
+			::GetClientRect(gHWnd, &clientRect);
+
+			int w = clientRect.right - clientRect.left;
+			int h = clientRect.bottom - clientRect.top;
+
+			Resize(w, h);
+		}
 			break;
 		case WM_DESTROY:
 			::PostQuitMessage(0);
